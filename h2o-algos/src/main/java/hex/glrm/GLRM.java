@@ -935,6 +935,7 @@ public class GLRM extends ModelBuilder<GLRMModel, GLRMModel.GLRMParameters, GLRM
         model._output._representation_name = StringUtils.isNullOrEmpty(_parms._representation_name) ?
                 "GLRMLoading_" + Key.rand() : _parms._representation_name;
         model._output._representation_key = Key.make(model._output._representation_name);
+        model._output._xFactorkey = model._output._representation_key;  // point to this key for default
 
         String[] xnames = new String[_ncolX];
         for (int i=0; i<_ncolX; i++) {
