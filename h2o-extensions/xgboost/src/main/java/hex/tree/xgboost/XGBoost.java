@@ -1,9 +1,6 @@
 package hex.tree.xgboost;
 
-import hex.DataInfo;
-import hex.ModelBuilder;
-import hex.ModelCategory;
-import hex.ScoreKeeper;
+import hex.*;
 import hex.genmodel.utils.DistributionFamily;
 import hex.glm.GLMTask;
 import hex.tree.xgboost.rabit.RabitTrackerH2O;
@@ -15,7 +12,6 @@ import ml.dmlc.xgboost4j.java.*;
 import water.exceptions.H2OIllegalArgumentException;
 import water.exceptions.H2OModelBuilderIllegalArgumentException;
 import water.fvec.Frame;
-import water.fvec.Vec;
 import water.util.*;
 import water.util.Timer;
 
@@ -291,18 +287,13 @@ public class XGBoost extends ModelBuilder<XGBoostModel,XGBoostModel.XGBoostParam
       final IRabitTracker rt;
       XGBoostSetupTask setupTask = null;
       try {
-        // Count on how many nodes the data resides
-        Set<H2ONode> nodesHoldingFrame = new HashSet<>();
-        Vec vec = train().anyVec();
-        for(int chunkNr = 0; chunkNr < vec.nChunks(); chunkNr++) {
-          nodesHoldingFrame.add(vec.chunkKey(chunkNr).home_node());
-        }
+        XGBoostSetupTask.FrameNodes trainFrameNodes = XGBoostSetupTask.findFrameNodes(_train);
 
         // Prepare Rabit tracker for this job
         // This cannot be H2O.getCloudSize() as a frame might not be distributed on all the nodes
         // In such a case we'll perform training only on a subset of nodes while XGBoost/Rabit would keep waiting
         // for H2O.getCloudSize() number of requests/responses.
-        rt = new RabitTrackerH2O(nodesHoldingFrame.size());
+        rt = new RabitTrackerH2O(trainFrameNodes.getNumNodes());
 
         if (!startRabitTracker(rt)) {
           throw new IllegalArgumentException("Cannot start XGboost rabit tracker, please, "
@@ -313,27 +304,25 @@ public class XGBoost extends ModelBuilder<XGBoostModel,XGBoostModel.XGBoostParam
         String featureMap = XGBoostUtils.makeFeatureMap(_train, model.model_info()._dataInfoKey.get());
         featureMapFile = createFeatureMapFile(featureMap);
 
-        setupTask = new XGBoostSetupTask(model.model_info(), _parms, model._output._sparse).doAll(_train);
-
         BoosterParms boosterParms = XGBoostModel.createParams(_parms, model._output.nclasses());
 
+        setupTask = new XGBoostSetupTask(model, _parms, boosterParms, getWorkerEnvs(rt), trainFrameNodes).run();
+
         try {
-          model.model_info().setBooster(new XGBoostUpdateTask(
-                  setupTask,
-                  model.model_info().getBooster(),
-                  boosterParms,
-                  0,
-                  getWorkerEnvs(rt)).doAll(_train).getBooster());
-          // Wait for results
+          // initial iteration
+          model.model_info().setBooster(new XGBoostUpdateTask(setupTask, 0).run().getBooster(boosterParms));
+
+          // train the model
+          scoreAndBuildTrees(setupTask, boosterParms, model);
+
+          // shutdown rabit & XGB native resources
+          XGBoostCleanupTask.cleanUp(setupTask);
+          setupTask = null;
+
           waitOnRabitWorkers(rt);
-        } catch (RuntimeException e) {
-          throw e;
         } finally {
           rt.stop();
         }
-
-        // train the model
-        scoreAndBuildTrees(setupTask, boosterParms, model, rt);
 
         // save the model to DKV
         model.model_info().nativeToJava();
@@ -371,8 +360,7 @@ public class XGBoost extends ModelBuilder<XGBoostModel,XGBoostModel.XGBoostParam
       }
     }
 
-    private void scoreAndBuildTrees(XGBoostSetupTask setupTask, BoosterParms boosterParms,
-                                    XGBoostModel model, IRabitTracker rt) throws XGBoostError {
+    private void scoreAndBuildTrees(XGBoostSetupTask setupTask, BoosterParms boosterParms, XGBoostModel model) throws XGBoostError {
       for( int tid=0; tid< _parms._ntrees; tid++) {
         // During first iteration model contains 0 trees, then 1-tree, ...
         boolean scored = doScoring(model, model.model_info().getBooster(), false);
@@ -383,19 +371,7 @@ public class XGBoost extends ModelBuilder<XGBoostModel,XGBoostModel.XGBoostParam
         }
 
         Timer kb_timer = new Timer();
-        startRabitTracker(rt);
-        try {
-          model.model_info().setBooster(new XGBoostUpdateTask(
-              setupTask,
-              model.model_info().getBooster(),
-              boosterParms,
-              tid,
-              getWorkerEnvs(rt)).doAll(_train).getBooster());
-          // Wait for successful completion
-          waitOnRabitWorkers(rt);
-        } finally {
-          rt.stop();
-        }
+        model.model_info().setBooster(new XGBoostUpdateTask(setupTask, tid).run().getBooster(boosterParms));
 
         Log.info((tid + 1) + ". tree was built in " + kb_timer.toString());
         _job.update(1);
@@ -527,7 +503,7 @@ public class XGBoost extends ModelBuilder<XGBoostModel,XGBoostModel.XGBoostParam
       return true;
     }
 
-    DMatrix trainMat = null;
+    DMatrix trainMat;
     try {
       trainMat = new DMatrix(new float[]{1,2,1,2},2,2);
       trainMat.setLabel(new float[]{1,0});
